@@ -1,222 +1,992 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Blind Assist - Speech + Cooldown + Priority</title>
+<title>Blind Assist - Object & Scene Detection</title>
+
 <style>
-  body { margin: 0; background: #111; color: #eee; font-family: sans-serif; text-align: center; }
-  #wrap { position: relative; display: inline-block; margin-top: 10px; }
-  video, canvas { width: 640px; max-width: 100vw; height: auto; display: block; }
-  canvas { position: absolute; top: 0; left: 0; }
-  button { font-size: 24px; padding: 16px 40px; margin: 12px; border-radius: 12px; border: 0; background: #2e8b57; color: #fff; cursor: pointer; }
-  #status { font-size: 18px; margin: 8px; }
-  #spoken { font-size: 22px; margin: 8px; color: #ffd54a; min-height: 30px; }
+  * {
+    box-sizing: border-box;
+  }
+
+  body {
+    margin: 0;
+    padding: 18px 12px 28px;
+    background: #111;
+    color: #eee;
+    font-family: Arial, sans-serif;
+    text-align: center;
+  }
+
+  h1 {
+    margin: 8px 0;
+    font-size: 25px;
+  }
+
+  #note {
+    max-width: 680px;
+    margin: 8px auto 14px;
+    color: #c9c9c9;
+    line-height: 1.45;
+    font-size: 14px;
+  }
+
+  #status {
+    font-size: 17px;
+    margin: 12px auto;
+    min-height: 24px;
+  }
+
+  #btn {
+    font-size: 21px;
+    padding: 14px 38px;
+    margin: 8px;
+    border-radius: 12px;
+    border: 0;
+    background: #2e8b57;
+    color: #fff;
+    cursor: pointer;
+  }
+
+  #btn:disabled {
+    opacity: .55;
+    cursor: wait;
+  }
+
+  #spoken {
+    font-size: 21px;
+    margin: 12px auto;
+    color: #ffd54a;
+    min-height: 30px;
+    max-width: 700px;
+    line-height: 1.4;
+  }
+
+  #wrap {
+    position: relative;
+    width: min(640px, 96vw);
+    margin: 12px auto;
+    background: #222;
+    overflow: hidden;
+  }
+
+  video, canvas {
+    width: 100%;
+    height: auto;
+    display: block;
+  }
+
+  canvas {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+  }
+
+  #legend {
+    color: #aaa;
+    font-size: 13px;
+    margin: 8px auto;
+  }
 </style>
 </head>
+
 <body>
-  <div id="status">Start dabao</div>
-  <button id="btn">Start</button>
-  <div id="spoken"></div>
-  <div id="wrap">
-    <video id="video" autoplay playsinline muted></video>
-    <canvas id="canvas"></canvas>
-  </div>
 
-  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3"></script>
-  <script>
-    const video = document.getElementById("video");
-    const canvas = document.getElementById("canvas");
-    const ctx = canvas.getContext("2d");
-    const statusEl = document.getElementById("status");
-    const spokenEl = document.getElementById("spoken");
-    const btn = document.getElementById("btn");
+<h1>Blind Assist</h1>
 
-    let model = null;
-    let running = false;
+<div id="note">
+  Object detection + your trained scene model.
+  This is an experimental prototype, not a safe navigation
+  or mobility aid. Keep a trusted person with you during testing.
+</div>
 
-    // ---------- SETTINGS (yahin se tune karna) ----------
-    const MIN_SCORE = 0.6;        // isse kam confidence ignore
-    const COOLDOWN_MS = 4000;     // same baat dobara 4 sec baad hi
-    const LOOP_DELAY_MS = 300;    // ~3 FPS
-    const NEAR_AREA = 0.15;       // isse bada box = "thodi door" ya usse paas
-    const VERY_NEAR_AREA = 0.4;   // isse bada box = "bahut paas"
+<div id="status">Start dabao</div>
 
-    // ---------- Speech setup ----------
-    let hindiVoice = null;
-    function pickVoice() {
-      const voices = speechSynthesis.getVoices();
-      hindiVoice = voices.find(v => v.lang.toLowerCase().startsWith("hi")) || null;
-    }
-    pickVoice();
-    speechSynthesis.onvoiceschanged = pickVoice;
+<button id="btn">Start</button>
 
-    const lastSpoken = {};        // key -> time
-    function speak(text, key, urgent = false) {
-      const now = Date.now();
-      if (lastSpoken[key] && now - lastSpoken[key] < COOLDOWN_MS) return;
-      if (speechSynthesis.speaking) {
-        if (!urgent) return;      // normal baat: chal rahi baat ko mat kaato
-        speechSynthesis.cancel(); // danger: purani baat roko, naya bolo
-      }
-      lastSpoken[key] = now;
-      const u = new SpeechSynthesisUtterance(text);
-      if (hindiVoice) { u.voice = hindiVoice; u.lang = hindiVoice.lang; } else { u.lang = "en-IN"; }
-      u.rate = 1.05;
-      speechSynthesis.speak(u);
-      spokenEl.textContent = "🔊 " + text;
-      console.log("SPEAK:", text);
-    }
+<div id="spoken" aria-live="polite"></div>
 
-    // ---------- Words (Hindi voice mile to Hindi, warna English) ----------
-    const NAMES_HI = {
-      person: "आदमी", chair: "कुर्सी", bottle: "बोतल", laptop: "लैपटॉप", "cell phone": "फोन",
-      bench: "बेंच", car: "गाड़ी", dog: "कुत्ता", couch: "सोफा", bed: "बिस्तर", tv: "टीवी",
-      cup: "कप", "dining table": "मेज़", backpack: "बैग", bicycle: "साइकिल", motorcycle: "बाइक"
-    };
-    const hi = () => !!hindiVoice;
-    const nameOf = c => (hi() && NAMES_HI[c]) ? NAMES_HI[c] : c;
-    const distWord = d => hi() ? (d === "bahut paas" ? "बहुत पास" : "थोड़ी दूर") : (d === "bahut paas" ? "very close" : "a bit far");
-    const sideWord = s => hi() ? (s === "left" ? "बाएं" : s === "right" ? "दाएं" : "सामने") : s;
+<div id="wrap">
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="canvas"></canvas>
+</div>
 
-    function sayCenterBlocked(obj, freeSide) {
-      const n = nameOf(obj.class), d = distWord(obj.dist);
-      if (!freeSide) return hi() ? `रुको, सामने ${n} है ${d}, दोनों तरफ़ रास्ता बंद है` : `Stop. ${n} ahead, ${d}. Both sides blocked.`;
-      return hi() ? `सामने ${n} है, ${d}. ${sideWord(freeSide)} से जाओ` : `${n} ahead, ${d}. Go ${freeSide}.`;
-    }
-    function saySideWarning(obj) {
-      const n = nameOf(obj.class);
-      return hi() ? `${sideWord(obj.dir)} में ${n} बहुत पास है` : `${n} very close on the ${obj.dir}.`;
-    }
+<div id="legend">
+  Green boxes: detected objects · Red boxes: large image area
+  (not a measured distance)
+</div>
 
-    // ---------- Camera ----------
-    async function startCamera() {
-      const stream = await navigator.mediaDevices.getUserMedia({
-  video: { facingMode: { ideal: "environment" } }
-});
-      video.srcObject = stream;
-      await new Promise(r => (video.onloadedmetadata = r));
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
-    }
 
-    // ---------- Direction + distance ----------
-    function getDirection(bbox) {
-      const [x, , w] = bbox;
-      const ratio = (x + w / 2) / video.videoWidth;
-      if (ratio < 0.33) return "left";
-      if (ratio > 0.66) return "right";
-      return "samne";
-    }
-    function getArea(bbox) {
-      return (bbox[2] * bbox[3]) / (video.videoWidth * video.videoHeight);
-    }
-    function getDistance(area) {
-      if (area > VERY_NEAR_AREA) return "bahut paas";
-      if (area > NEAR_AREA) return "thodi door";
-      return "door";
-    }
+<!-- MACHINE LEARNING LIBRARIES -->
 
-    // ---------- Decision logic ----------
-    function decide(objs) {
-      // sirf paas wali cheezein matter karti hain
-      const near = objs.filter(o => o.dist !== "door");
-      const center = near.filter(o => o.dir === "samne").sort((a, b) => b.area - a.area);
-      const left = near.filter(o => o.dir === "left");
-      const right = near.filter(o => o.dir === "right");
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0"></script>
 
-      if (center.length) {
-        const top = center[0];
-        const leftLoad = left.reduce((s, o) => s + o.area, 0);
-        const rightLoad = right.reduce((s, o) => s + o.area, 0);
-        let freeSide = null;
-        if (leftLoad === 0 && rightLoad === 0) freeSide = "right"; // dono khaali: default right
-        else if (leftLoad === 0) freeSide = "left";
-        else if (rightLoad === 0) freeSide = "right";
-        // dono side mein kuch hai to freeSide = null (ruko)
-        const text = sayCenterBlocked(top, freeSide);
-        const key = `C:${top.class}:${top.dist}:${freeSide}`;
-        speak(text, key, top.dist === "bahut paas");
-        return;
-      }
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3"></script>
 
-      // center khaali hai, par side mein koi bahut paas hai
-      const sideClose = [...left, ...right].filter(o => o.dist === "bahut paas").sort((a, b) => b.area - a.area);
-      if (sideClose.length) {
-        const o = sideClose[0];
-        speak(saySideWarning(o), `S:${o.class}:${o.dir}`);
-      }
-    }
+<script src="https://cdn.jsdelivr.net/npm/@teachablemachine/image@0.8/dist/teachablemachine-image.min.js"></script>
 
-    // ---------- Main loop ----------
-    async function loop() {
-      if (!running) return;
 
-      const predictions = await model.detect(video);
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
+<script>
 
-      ctx.strokeStyle = "rgba(255,255,255,0.3)";
-      ctx.beginPath();
-      ctx.moveTo(canvas.width * 0.33, 0); ctx.lineTo(canvas.width * 0.33, canvas.height);
-      ctx.moveTo(canvas.width * 0.66, 0); ctx.lineTo(canvas.width * 0.66, canvas.height);
-      ctx.stroke();
+// ======================================
+// PAGE ELEMENTS
+// ======================================
 
-      const objs = [];
-      for (const p of predictions) {
-        if (p.score < MIN_SCORE) continue;
-        const area = getArea(p.bbox);
-        const o = { class: p.class, score: p.score, bbox: p.bbox, area, dir: getDirection(p.bbox), dist: getDistance(area) };
-        objs.push(o);
+const video = document.getElementById("video");
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
 
-        const [x, y, w, h] = p.bbox;
-        ctx.strokeStyle = o.dist === "bahut paas" ? "#ff4d4d" : "#00ff88";
-        ctx.lineWidth = 3;
-        ctx.strokeRect(x, y, w, h);
-        const label = `${o.class} ${Math.round(o.score * 100)}% - ${o.dir}, ${o.dist}`;
-        ctx.font = "16px sans-serif";
-        const tw = ctx.measureText(label).width;
-        ctx.fillStyle = ctx.strokeStyle;
-        ctx.fillRect(x, y - 22, tw + 10, 22);
-        ctx.fillStyle = "#000";
-        ctx.fillText(label, x + 5, y - 5);
-      }
+const statusEl = document.getElementById("status");
+const spokenEl = document.getElementById("spoken");
+const btn = document.getElementById("btn");
 
-      statusEl.textContent = objs.length ? `${objs.length} cheez detect hui` : "Kuch detect nahi hua";
-      decide(objs);
 
-      setTimeout(() => requestAnimationFrame(loop), LOOP_DELAY_MS);
-    }
+// ======================================
+// YOUR TRAINED TEACHABLE MACHINE MODEL
+// ======================================
 
-    btn.onclick = async () => {
-      if (running) {
-        running = false;
-        speechSynthesis.cancel();
-        btn.textContent = "Start";
-        statusEl.textContent = "Ruka hua";
-        return;
-      }
-      try {
-        btn.disabled = true;
-        // user click par speech "unlock" karo (browser ki rule)
-        speechSynthesis.speak(new SpeechSynthesisUtterance(" "));
-        statusEl.textContent = "Camera chalu ho raha hai...";
-        await startCamera();
-        if (!model) {
-          statusEl.textContent = "Model load ho raha hai...";
-          model = await cocoSsd.load({ base: "lite_mobilenet_v2" });
+const SCENE_MODEL_URL =
+"https://teachablemachine.withgoogle.com/models/FEHYjMU6z/";
+
+
+// ======================================
+// RUNTIME VARIABLES
+// ======================================
+
+let objectModel = null;
+let sceneModel = null;
+
+let cameraStream = null;
+let running = false;
+let wakeLock = null;
+let loopTimer = null;
+
+let lastSceneLabel = "";
+let lastSceneAt = 0;
+
+let lastObjectAlertAt = 0;
+let lastObjectAlertKey = "";
+
+
+// ======================================
+// SETTINGS
+// ======================================
+
+const OBJECT_MIN_SCORE = 0.60;
+
+const LARGE_BOX_AREA = 0.18;
+
+const OBJECT_ALERT_COOLDOWN = 4500;
+
+const SCENE_CONFIDENCE = 0.80;
+
+const SCENE_INTERVAL_MS = 1000;
+
+const LOOP_DELAY_MS = 450;
+
+
+// ======================================
+// SPEECH SYSTEM
+// ======================================
+
+let hindiVoice = null;
+
+function pickVoice() {
+
+  const voices = window.speechSynthesis
+    ? speechSynthesis.getVoices()
+    : [];
+
+  hindiVoice =
+    voices.find(v =>
+      v.lang && v.lang.toLowerCase().startsWith("hi")
+    ) || null;
+
+}
+
+if ("speechSynthesis" in window) {
+
+  pickVoice();
+
+  speechSynthesis.onvoiceschanged = pickVoice;
+
+}
+
+
+function speak(hiText, enText) {
+
+  if (!("speechSynthesis" in window)) return;
+
+  const text = hindiVoice ? hiText : enText;
+
+  speechSynthesis.cancel();
+
+  const utterance = new SpeechSynthesisUtterance(text);
+
+  if (hindiVoice) {
+
+    utterance.voice = hindiVoice;
+    utterance.lang = hindiVoice.lang;
+
+  } else {
+
+    utterance.lang = "en-IN";
+
+  }
+
+  utterance.rate = 1.0;
+
+  spokenEl.textContent = "🔊 " + text;
+
+  speechSynthesis.speak(utterance);
+
+}
+
+
+// ======================================
+// CAMERA SYSTEM
+// ======================================
+
+async function startCamera() {
+
+  if (
+    !navigator.mediaDevices ||
+    !navigator.mediaDevices.getUserMedia
+  ) {
+
+    throw new Error(
+      "Camera access unavailable. Open this page using HTTPS."
+    );
+
+  }
+
+  cameraStream =
+    await navigator.mediaDevices.getUserMedia({
+
+      audio: false,
+
+      video: {
+        facingMode: {
+          ideal: "environment"
         }
-        running = true;
-        btn.textContent = "Stop";
-        statusEl.textContent = "Chal raha hai" + (hindiVoice ? " (Hindi voice)" : " (English voice)");
-        loop();
-      } catch (e) {
-        console.error(e);
-        statusEl.textContent = "Error: " + e.message;
-      } finally {
-        btn.disabled = false;
       }
-    };
-  </script>
+
+    });
+
+  video.srcObject = cameraStream;
+
+  await new Promise((resolve, reject) => {
+
+    if (video.readyState >= 1) {
+      return resolve();
+    }
+
+    video.onloadedmetadata = resolve;
+
+    video.onerror = () =>
+      reject(new Error("Video could not start."));
+
+  });
+
+  await video.play();
+
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+
+}
+
+
+// ======================================
+// KEEP SCREEN ON
+// ======================================
+
+async function keepScreenOn() {
+
+  try {
+
+    if ("wakeLock" in navigator) {
+
+      wakeLock =
+        await navigator.wakeLock.request("screen");
+
+    }
+
+  } catch (error) {
+
+    console.log("Wake lock unavailable:", error);
+
+  }
+
+}
+
+
+async function releaseScreenLock() {
+
+  if (wakeLock) {
+
+    try {
+
+      await wakeLock.release();
+
+    } catch (_) {}
+
+    wakeLock = null;
+
+  }
+
+}
+
+
+// ======================================
+// STOP CAMERA
+// ======================================
+
+function stopCamera() {
+
+  if (cameraStream) {
+
+    cameraStream.getTracks().forEach(track =>
+      track.stop()
+    );
+
+    cameraStream = null;
+
+  }
+
+  video.srcObject = null;
+
+}
+
+
+// ======================================
+// OBJECT DETECTION HELPERS
+// ======================================
+
+function getDirection(bbox) {
+
+  const centerX =
+    (bbox[0] + bbox[2] / 2) / video.videoWidth;
+
+  if (centerX < 0.33) return "left";
+
+  if (centerX > 0.66) return "right";
+
+  return "center";
+
+}
+
+
+function getBoxAreaRatio(bbox) {
+
+  return (
+    (bbox[2] * bbox[3]) /
+    (video.videoWidth * video.videoHeight)
+  );
+
+}
+
+
+// ======================================
+// DRAW DETECTED OBJECTS
+// ======================================
+
+function drawObjects(predictions) {
+
+  ctx.clearRect(
+    0,
+    0,
+    canvas.width,
+    canvas.height
+  );
+
+  // Divide screen into three parts
+
+  ctx.strokeStyle = "rgba(255,255,255,0.35)";
+  ctx.lineWidth = 2;
+
+  ctx.beginPath();
+
+  ctx.moveTo(canvas.width * 0.33, 0);
+  ctx.lineTo(canvas.width * 0.33, canvas.height);
+
+  ctx.moveTo(canvas.width * 0.66, 0);
+  ctx.lineTo(canvas.width * 0.66, canvas.height);
+
+  ctx.stroke();
+
+  let accepted = 0;
+
+  for (const prediction of predictions) {
+
+    if (prediction.score < OBJECT_MIN_SCORE) {
+      continue;
+    }
+
+    accepted++;
+
+    const [x, y, w, h] = prediction.bbox;
+
+    const areaRatio =
+      getBoxAreaRatio(prediction.bbox);
+
+    const boxColor =
+      areaRatio >= LARGE_BOX_AREA
+        ? "#ff5b5b"
+        : "#00e68a";
+
+    const side =
+      getDirection(prediction.bbox);
+
+    const label =
+      `${prediction.class} (${Math.round(
+        prediction.score * 100
+      )}%) - ${side}`;
+
+    ctx.strokeStyle = boxColor;
+    ctx.lineWidth = 3;
+
+    ctx.strokeRect(x, y, w, h);
+
+    ctx.font = "16px Arial";
+
+    const labelWidth =
+      ctx.measureText(label).width;
+
+    const labelY = Math.max(0, y - 24);
+
+    ctx.fillStyle = boxColor;
+
+    ctx.fillRect(
+      x,
+      labelY,
+      labelWidth + 10,
+      24
+    );
+
+    ctx.fillStyle = "#111";
+
+    ctx.fillText(
+      label,
+      x + 5,
+      labelY + 17
+    );
+
+  }
+
+  return accepted;
+
+}
+
+
+// ======================================
+// OBJECT VOICE ALERTS
+// ======================================
+
+function maybeAnnounceObject(predictions) {
+
+  const candidates = predictions
+
+    .filter(p =>
+      p.score >= OBJECT_MIN_SCORE
+    )
+
+    .map(p => ({
+
+      name: p.class,
+
+      score: p.score,
+
+      area: getBoxAreaRatio(p.bbox),
+
+      side: getDirection(p.bbox)
+
+    }))
+
+    .filter(o =>
+      o.area >= LARGE_BOX_AREA
+    )
+
+    .sort((a, b) =>
+      b.area - a.area
+    );
+
+
+  if (!candidates.length) {
+
+    lastObjectAlertKey = "";
+
+    return;
+
+  }
+
+
+  const item = candidates[0];
+
+  const key =
+    `${item.name}-${item.side}`;
+
+  const now = Date.now();
+
+
+  if (
+    key === lastObjectAlertKey &&
+    now - lastObjectAlertAt < OBJECT_ALERT_COOLDOWN
+  ) {
+
+    return;
+
+  }
+
+
+  lastObjectAlertKey = key;
+  lastObjectAlertAt = now;
+
+
+  const sideHi =
+    item.side === "left"
+      ? "बाईं तरफ"
+      : item.side === "right"
+      ? "दाईं तरफ"
+      : "सामने";
+
+
+  const sideEn =
+    item.side === "left"
+      ? "on the left"
+      : item.side === "right"
+      ? "on the right"
+      : "in the center";
+
+
+  speak(
+    `${item.name}, ${sideHi} दिखाई दे रहा है।`,
+    `${item.name} detected ${sideEn}.`
+  );
+
+}
+
+
+// ======================================
+// TEACHABLE MACHINE SCENE CLASSIFICATION
+// ======================================
+
+function sceneMessage(className) {
+
+  const key =
+    className.toLowerCase().trim();
+
+
+  if (key === "clear floor") {
+
+    return [
+
+      "फर्श जैसा दृश्य दिखाई दे रहा है। रास्ता सुरक्षित होने की पुष्टि नहीं है।",
+
+      "Floor-like scene detected. This does not confirm the path is safe."
+
+    ];
+
+  }
+
+
+  if (
+    key === "wall door" ||
+    key === "wall door close"
+  ) {
+
+    return [
+
+      "दीवार या दरवाजे जैसा दृश्य दिखाई दे रहा है।",
+
+      "Wall or door-like scene detected."
+
+    ];
+
+  }
+
+
+  if (key === "stairs up") {
+
+    return [
+
+      "सीढ़ियों जैसा दृश्य दिखाई दे रहा है। सावधानी रखें।",
+
+      "Stairs-like scene detected. Please use caution."
+
+    ];
+
+  }
+
+
+  return [
+
+    `${className} जैसा दृश्य दिखाई दे रहा है।`,
+
+    `${className} scene detected.`
+
+  ];
+
+}
+
+
+// ======================================
+// RUN TRAINED SCENE MODEL
+// ======================================
+
+async function detectScene() {
+
+  if (
+    !sceneModel ||
+    !running ||
+    video.readyState < 2
+  ) {
+
+    return;
+
+  }
+
+
+  const predictions =
+    await sceneModel.predict(video);
+
+
+  predictions.sort((a, b) =>
+    b.probability - a.probability
+  );
+
+
+  const best = predictions[0];
+
+
+  if (
+    !best ||
+    best.probability < SCENE_CONFIDENCE
+  ) {
+
+    statusEl.textContent =
+      "Scene unclear — keep testing safely";
+
+    return;
+
+  }
+
+
+  const now = Date.now();
+
+  const labelChanged =
+    best.className !== lastSceneLabel;
+
+  const intervalPassed =
+    now - lastSceneAt >= SCENE_INTERVAL_MS;
+
+
+  if (
+    labelChanged ||
+    (
+      intervalPassed &&
+      best.className === lastSceneLabel
+    )
+  ) {
+
+    lastSceneLabel = best.className;
+
+    lastSceneAt = now;
+
+    const message =
+      sceneMessage(best.className);
+
+
+    speak(
+      message[0],
+      message[1]
+    );
+
+
+    statusEl.textContent =
+      `Scene: ${best.className} (${
+        Math.round(best.probability * 100)
+      }%)`;
+
+  }
+
+}
+
+
+// ======================================
+// MAIN DETECTION LOOP
+// ======================================
+
+async function loop() {
+
+  if (!running) return;
+
+  try {
+
+    if (
+      video.readyState >= 2 &&
+      objectModel
+    ) {
+
+      const predictions =
+        await objectModel.detect(video);
+
+
+      const count =
+        drawObjects(predictions);
+
+
+      maybeAnnounceObject(predictions);
+
+
+      if (!lastSceneLabel) {
+
+        statusEl.textContent =
+          count
+            ? `${count} object(s) detected · checking scene...`
+            : "No confident objects detected · checking scene...";
+
+      }
+
+    }
+
+
+    // Scene classification runs less frequently
+    // to reduce device load.
+
+    if (
+      running &&
+      sceneModel &&
+      Date.now() - lastSceneAt >= SCENE_INTERVAL_MS
+    ) {
+
+      await detectScene();
+
+    }
+
+  } catch (error) {
+
+    console.error(
+      "Detection loop error:",
+      error
+    );
+
+    statusEl.textContent =
+      "Detection issue: " + error.message;
+
+  }
+
+
+  if (running) {
+
+    loopTimer = setTimeout(() => {
+
+      requestAnimationFrame(loop);
+
+    }, LOOP_DELAY_MS);
+
+  }
+
+}
+
+
+// ======================================
+// STOP ASSIST
+// ======================================
+
+async function stopAssist() {
+
+  running = false;
+
+  if (loopTimer) {
+
+    clearTimeout(loopTimer);
+
+    loopTimer = null;
+
+  }
+
+
+  if ("speechSynthesis" in window) {
+
+    speechSynthesis.cancel();
+
+  }
+
+
+  await releaseScreenLock();
+
+  stopCamera();
+
+
+  ctx.clearRect(
+    0,
+    0,
+    canvas.width,
+    canvas.height
+  );
+
+
+  btn.textContent = "Start";
+
+  statusEl.textContent = "Stopped";
+
+}
+
+
+// ======================================
+// START BUTTON
+// ======================================
+
+btn.addEventListener("click", async () => {
+
+  if (running) {
+
+    await stopAssist();
+
+    return;
+
+  }
+
+
+  btn.disabled = true;
+
+  statusEl.textContent =
+    "Starting camera...";
+
+  spokenEl.textContent = "";
+
+
+  try {
+
+    // Unlock speech on user interaction
+
+    if ("speechSynthesis" in window) {
+
+      const unlock =
+        new SpeechSynthesisUtterance("");
+
+      speechSynthesis.speak(unlock);
+
+    }
+
+
+    // Start camera
+
+    await startCamera();
+
+    await keepScreenOn();
+
+
+    // Load COCO-SSD
+
+    if (!objectModel) {
+
+      statusEl.textContent =
+        "Loading object detection model...";
+
+      objectModel =
+        await cocoSsd.load({
+
+          base: "lite_mobilenet_v2"
+
+        });
+
+    }
+
+
+    // Load your trained Teachable Machine model
+
+    if (!sceneModel) {
+
+      statusEl.textContent =
+        "Loading your trained scene model...";
+
+      sceneModel =
+        await tmImage.load(
+
+          SCENE_MODEL_URL + "model.json",
+
+          SCENE_MODEL_URL + "metadata.json"
+
+        );
+
+    }
+
+
+    // Start detection
+
+    running = true;
+
+    lastSceneLabel = "";
+    lastSceneAt = 0;
+
+    lastObjectAlertAt = 0;
+    lastObjectAlertKey = "";
+
+
+    btn.textContent = "Stop";
+
+    statusEl.textContent =
+      "Running · object + scene detection";
+
+
+    speak(
+      "ब्लाइंड असिस्ट शुरू हो गया है।",
+      "Blind Assist started."
+    );
+
+
+    loop();
+
+
+  } catch (error) {
+
+    console.error(error);
+
+    statusEl.textContent =
+      "Error: " + error.message;
+
+    await stopAssist();
+
+    statusEl.textContent =
+      "Could not start: " + error.message;
+
+  } finally {
+
+    btn.disabled = false;
+
+  }
+
+});
+
+
+// ======================================
+// CLEANUP WHEN PAGE CLOSES
+// ======================================
+
+window.addEventListener("pagehide", () => {
+
+  running = false;
+
+  if (cameraStream) {
+
+    cameraStream.getTracks().forEach(track =>
+      track.stop()
+    );
+
+  }
+
+  if ("speechSynthesis" in window) {
+
+    speechSynthesis.cancel();
+
+  }
+
+});
+
+</script>
+
 </body>
 </html>
