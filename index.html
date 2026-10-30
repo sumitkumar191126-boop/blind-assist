@@ -1,992 +1,284 @@
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Blind Assist - Object & Scene Detection</title>
-
+<title>Blind Assist v5</title>
 <style>
-  * {
-    box-sizing: border-box;
-  }
-
-  body {
-    margin: 0;
-    padding: 18px 12px 28px;
-    background: #111;
-    color: #eee;
-    font-family: Arial, sans-serif;
-    text-align: center;
-  }
-
-  h1 {
-    margin: 8px 0;
-    font-size: 25px;
-  }
-
-  #note {
-    max-width: 680px;
-    margin: 8px auto 14px;
-    color: #c9c9c9;
-    line-height: 1.45;
-    font-size: 14px;
-  }
-
-  #status {
-    font-size: 17px;
-    margin: 12px auto;
-    min-height: 24px;
-  }
-
-  #btn {
-    font-size: 21px;
-    padding: 14px 38px;
-    margin: 8px;
-    border-radius: 12px;
-    border: 0;
-    background: #2e8b57;
-    color: #fff;
-    cursor: pointer;
-  }
-
-  #btn:disabled {
-    opacity: .55;
-    cursor: wait;
-  }
-
-  #spoken {
-    font-size: 21px;
-    margin: 12px auto;
-    color: #ffd54a;
-    min-height: 30px;
-    max-width: 700px;
-    line-height: 1.4;
-  }
-
-  #wrap {
-    position: relative;
-    width: min(640px, 96vw);
-    margin: 12px auto;
-    background: #222;
-    overflow: hidden;
-  }
-
-  video, canvas {
-    width: 100%;
-    height: auto;
-    display: block;
-  }
-
-  canvas {
-    position: absolute;
-    inset: 0;
-    pointer-events: none;
-  }
-
-  #legend {
-    color: #aaa;
-    font-size: 13px;
-    margin: 8px auto;
-  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 14px 10px 26px; background: #111; color: #eee; font-family: Arial, sans-serif; text-align: center; }
+  h1 { margin: 6px 0; font-size: 24px; }
+  #note { max-width: 680px; margin: 6px auto 10px; color: #bbb; line-height: 1.4; font-size: 13px; }
+  #status { font-size: 16px; margin: 8px auto; min-height: 22px; }
+  #btn { width: 92vw; max-width: 640px; font-size: 28px; padding: 24px 0; margin: 8px; border-radius: 16px; border: 0; background: #2e8b57; color: #fff; cursor: pointer; }
+  #btn:disabled { opacity: .55; cursor: wait; }
+  #spoken { font-size: 24px; margin: 8px auto; color: #ffd54a; min-height: 32px; max-width: 700px; }
+  #scene { font-size: 15px; color: #8ecbff; min-height: 20px; }
+  #wrap { position: relative; width: min(640px, 96vw); margin: 10px auto; background: #222; overflow: hidden; }
+  video, canvas { width: 100%; height: auto; display: block; }
+  canvas { position: absolute; inset: 0; pointer-events: none; }
 </style>
 </head>
-
 <body>
-
 <h1>Blind Assist</h1>
-
-<div id="note">
-  Object detection + your trained scene model.
-  This is an experimental prototype, not a safe navigation
-  or mobility aid. Keep a trusted person with you during testing.
-</div>
-
+<div id="note">Experimental prototype. Not a safe navigation or mobility aid. Keep a trusted person with you while testing.</div>
 <div id="status">Start dabao</div>
-
 <button id="btn">Start</button>
-
 <div id="spoken" aria-live="polite"></div>
-
+<div id="scene"></div>
 <div id="wrap">
   <video id="video" autoplay playsinline muted></video>
   <canvas id="canvas"></canvas>
 </div>
 
-<div id="legend">
-  Green boxes: detected objects · Red boxes: large image area
-  (not a measured distance)
-</div>
-
-
-<!-- MACHINE LEARNING LIBRARIES -->
-
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0"></script>
-
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3"></script>
-
-<script src="https://cdn.jsdelivr.net/npm/@teachablemachine/image@0.8/dist/teachablemachine-image.min.js"></script>
-
-
 <script>
-
-// ======================================
-// PAGE ELEMENTS
-// ======================================
-
 const video = document.getElementById("video");
 const canvas = document.getElementById("canvas");
 const ctx = canvas.getContext("2d");
-
 const statusEl = document.getElementById("status");
 const spokenEl = document.getElementById("spoken");
+const sceneEl = document.getElementById("scene");
 const btn = document.getElementById("btn");
 
+// ================= SETTINGS =================
+const SCENE_MODEL_URL = "https://teachablemachine.withgoogle.com/models/FEHYjMU6z/";
+const SCENE_MIN_CONF = 0.8;
+const SCENE_EVERY_N_LOOPS = 2;
 
-// ======================================
-// YOUR TRAINED TEACHABLE MACHINE MODEL
-// ======================================
+const MIN_SCORE = 0.5;
+const LOOP_DELAY_MS = 350;
+const NEAR_AREA = 0.15, VERY_NEAR_AREA = 0.4;
+const BLOCK_COOLDOWN_MS = 3000, CLEAR_COOLDOWN_MS = 8000;
+const CLEAR_FRAMES_NEEDED = 3;
+const CENTER_STREAK_NEEDED = 2;
 
-const SCENE_MODEL_URL =
-"https://teachablemachine.withgoogle.com/models/FEHYjMU6z/";
+let objectModel = null, sceneModel = null, sceneLabels = [];
+let cameraStream = null, running = false, wakeLock = null, loopTimer = null, loopCount = 0;
 
-
-// ======================================
-// RUNTIME VARIABLES
-// ======================================
-
-let objectModel = null;
-let sceneModel = null;
-
-let cameraStream = null;
-let running = false;
-let wakeLock = null;
-let loopTimer = null;
-
-let lastSceneLabel = "";
-let lastSceneAt = 0;
-
-let lastObjectAlertAt = 0;
-let lastObjectAlertKey = "";
-
-
-// ======================================
-// SETTINGS
-// ======================================
-
-const OBJECT_MIN_SCORE = 0.60;
-
-const LARGE_BOX_AREA = 0.18;
-
-const OBJECT_ALERT_COOLDOWN = 4500;
-
-const SCENE_CONFIDENCE = 0.80;
-
-const SCENE_INTERVAL_MS = 1000;
-
-const LOOP_DELAY_MS = 450;
-
-
-// ======================================
-// SPEECH SYSTEM
-// ======================================
-
+// ================= Speech + vibration =================
 let hindiVoice = null;
-
 function pickVoice() {
-
-  const voices = window.speechSynthesis
-    ? speechSynthesis.getVoices()
-    : [];
-
-  hindiVoice =
-    voices.find(v =>
-      v.lang && v.lang.toLowerCase().startsWith("hi")
-    ) || null;
-
-}
-
-if ("speechSynthesis" in window) {
-
-  pickVoice();
-
-  speechSynthesis.onvoiceschanged = pickVoice;
-
-}
-
-
-function speak(hiText, enText) {
-
   if (!("speechSynthesis" in window)) return;
+  hindiVoice = speechSynthesis.getVoices().find(v => v.lang && v.lang.toLowerCase().startsWith("hi")) || null;
+}
+pickVoice();
+if ("speechSynthesis" in window) speechSynthesis.onvoiceschanged = pickVoice;
 
-  const text = hindiVoice ? hiText : enText;
-
-  speechSynthesis.cancel();
-
-  const utterance = new SpeechSynthesisUtterance(text);
-
-  if (hindiVoice) {
-
-    utterance.voice = hindiVoice;
-    utterance.lang = hindiVoice.lang;
-
-  } else {
-
-    utterance.lang = "en-IN";
-
+const lastSpoken = {};
+function buzz(p) { try { if (navigator.vibrate) navigator.vibrate(p); } catch (e) {} }
+function speak(hiText, enText, key, cooldown, urgent = false, vib = null) {
+  if (!("speechSynthesis" in window)) return;
+  const now = Date.now();
+  if (lastSpoken[key] && now - lastSpoken[key] < cooldown) return;
+  if (speechSynthesis.speaking) {
+    if (!urgent) return;
+    speechSynthesis.cancel();
   }
-
-  utterance.rate = 1.0;
-
+  lastSpoken[key] = now;
+  if (vib) buzz(vib);
+  const text = hindiVoice ? hiText : enText;
+  const u = new SpeechSynthesisUtterance(text);
+  if (hindiVoice) { u.voice = hindiVoice; u.lang = hindiVoice.lang; } else { u.lang = "en-IN"; }
+  u.rate = 1.05;
+  speechSynthesis.speak(u);
   spokenEl.textContent = "🔊 " + text;
-
-  speechSynthesis.speak(utterance);
-
 }
 
-
-// ======================================
-// CAMERA SYSTEM
-// ======================================
-
+// ================= Camera, screen lock =================
 async function startCamera() {
-
-  if (
-    !navigator.mediaDevices ||
-    !navigator.mediaDevices.getUserMedia
-  ) {
-
-    throw new Error(
-      "Camera access unavailable. Open this page using HTTPS."
-    );
-
-  }
-
-  cameraStream =
-    await navigator.mediaDevices.getUserMedia({
-
-      audio: false,
-
-      video: {
-        facingMode: {
-          ideal: "environment"
-        }
-      }
-
-    });
-
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia)
+    throw new Error("Camera unavailable. Open this page using HTTPS.");
+  cameraStream = await navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: { ideal: "environment" } } });
   video.srcObject = cameraStream;
-
-  await new Promise((resolve, reject) => {
-
-    if (video.readyState >= 1) {
-      return resolve();
-    }
-
-    video.onloadedmetadata = resolve;
-
-    video.onerror = () =>
-      reject(new Error("Video could not start."));
-
-  });
-
+  await new Promise(r => { if (video.readyState >= 1) return r(); video.onloadedmetadata = r; });
   await video.play();
-
   canvas.width = video.videoWidth;
   canvas.height = video.videoHeight;
-
 }
-
-
-// ======================================
-// KEEP SCREEN ON
-// ======================================
-
-async function keepScreenOn() {
-
-  try {
-
-    if ("wakeLock" in navigator) {
-
-      wakeLock =
-        await navigator.wakeLock.request("screen");
-
-    }
-
-  } catch (error) {
-
-    console.log("Wake lock unavailable:", error);
-
-  }
-
-}
-
-
-async function releaseScreenLock() {
-
-  if (wakeLock) {
-
-    try {
-
-      await wakeLock.release();
-
-    } catch (_) {}
-
-    wakeLock = null;
-
-  }
-
-}
-
-
-// ======================================
-// STOP CAMERA
-// ======================================
-
 function stopCamera() {
-
-  if (cameraStream) {
-
-    cameraStream.getTracks().forEach(track =>
-      track.stop()
-    );
-
-    cameraStream = null;
-
-  }
-
+  if (cameraStream) { cameraStream.getTracks().forEach(t => t.stop()); cameraStream = null; }
   video.srcObject = null;
-
+}
+async function keepScreenOn() {
+  try { if ("wakeLock" in navigator) wakeLock = await navigator.wakeLock.request("screen"); } catch (e) {}
+}
+async function releaseScreenLock() {
+  if (wakeLock) { try { await wakeLock.release(); } catch (e) {} wakeLock = null; }
 }
 
-
-// ======================================
-// OBJECT DETECTION HELPERS
-// ======================================
-
-function getDirection(bbox) {
-
-  const centerX =
-    (bbox[0] + bbox[2] / 2) / video.videoWidth;
-
-  if (centerX < 0.33) return "left";
-
-  if (centerX > 0.66) return "right";
-
-  return "center";
-
+// ================= Scene model (Teachable Machine, bina extra library) =================
+async function loadSceneModel() {
+  sceneModel = await tf.loadLayersModel(SCENE_MODEL_URL + "model.json");
+  const meta = await (await fetch(SCENE_MODEL_URL + "metadata.json")).json();
+  sceneLabels = meta.labels;
+  console.log("Scene labels:", sceneLabels);
+}
+function sceneKind(label) {
+  const l = label.toLowerCase();
+  if (l.includes("down")) return "stairs_down";
+  if (l.includes("stair") || l.includes("up")) return "stairs_up";
+  if (l.includes("wall") || l.includes("door")) return "wall";
+  if (l.includes("clear") || l.includes("floor") || l.includes("free")) return "clear";
+  return "unknown";
+}
+let lastScene = null, sceneStreak = 0, scene = "unknown";
+async function classifyScene() {
+  const probs = tf.tidy(() => {
+    let img = tf.browser.fromPixels(video);
+    const [h, w] = img.shape, s = Math.min(h, w);
+    img = img.slice([Math.floor((h - s) / 2), Math.floor((w - s) / 2), 0], [s, s, 3]);
+    img = tf.image.resizeBilinear(img, [224, 224]).toFloat().div(127.5).sub(1).expandDims(0);
+    return sceneModel.predict(img);
+  });
+  const arr = await probs.data();
+  probs.dispose();
+  let best = 0;
+  for (let i = 1; i < arr.length; i++) if (arr[i] > arr[best]) best = i;
+  const kind = arr[best] >= SCENE_MIN_CONF ? sceneKind(sceneLabels[best]) : "unknown";
+  sceneStreak = (kind === lastScene) ? sceneStreak + 1 : 1;
+  lastScene = kind;
+  sceneEl.textContent = `Scene: ${sceneLabels[best]} (${Math.round(arr[best] * 100)}%)`;
+  return sceneStreak >= 2 ? kind : "unknown";
 }
 
+// ================= Objects: direction + distance =================
+const getDirection = b => { const r = (b[0] + b[2] / 2) / video.videoWidth; return r < 0.33 ? "left" : r > 0.66 ? "right" : "samne"; };
+const getArea = b => (b[2] * b[3]) / (video.videoWidth * video.videoHeight);
+const getDistance = a => a > VERY_NEAR_AREA ? "bahut paas" : a > NEAR_AREA ? "thodi door" : "door";
 
-function getBoxAreaRatio(bbox) {
+// ================= Decision =================
+let clearCount = 0, centerStreak = 0;
+function decide(objs) {
+  // 1) Scene: seedhi / diwar sabse upar
+  if (scene === "stairs_down") { clearCount = 0; speak("सावधान, सीढ़ी नीचे है, रुको", "Careful, stairs going down, stop", "sd", BLOCK_COOLDOWN_MS, true, [300, 100, 300]); return; }
+  if (scene === "wall") { clearCount = 0; speak("रुको, सामने दीवार या दरवाज़ा है", "Stop, wall or door ahead", "wall", BLOCK_COOLDOWN_MS, true, [200, 100, 200]); return; }
+  if (scene === "stairs_up") { clearCount = 0; speak("सीढ़ी ऊपर जा रही है, सावधान", "Stairs going up, careful", "su", 4000, false, [150]); return; }
 
-  return (
-    (bbox[2] * bbox[3]) /
-    (video.videoWidth * video.videoHeight)
-  );
+  // 2) Objects: sirf direction
+  const near = objs.filter(o => o.dist !== "door");
+  const center = near.filter(o => o.dir === "samne");
+  const leftLoad = near.filter(o => o.dir === "left").reduce((s, o) => s + o.area, 0);
+  const rightLoad = near.filter(o => o.dir === "right").reduce((s, o) => s + o.area, 0);
+  centerStreak = center.length ? centerStreak + 1 : 0;
+  const veryNear = center.some(o => o.dist === "bahut paas");
 
+  if (center.length && (veryNear || centerStreak >= CENTER_STREAK_NEEDED)) {
+    clearCount = 0;
+    let side = null;
+    if (leftLoad === 0 && rightLoad === 0) side = "right";
+    else if (leftLoad === 0) side = "left";
+    else if (rightLoad === 0) side = "right";
+    const vib = veryNear ? [200] : null;
+    if (!side) speak("रुको", "Stop", "stop", BLOCK_COOLDOWN_MS, true, [200, 100, 200]);
+    else if (side === "left") speak(veryNear ? "रुको, बाएं से जाओ" : "बाएं से जाओ", veryNear ? "Stop, go left" : "Go left", "L" + veryNear, BLOCK_COOLDOWN_MS, veryNear, vib);
+    else speak(veryNear ? "रुको, दाएं से जाओ" : "दाएं से जाओ", veryNear ? "Stop, go right" : "Go right", "R" + veryNear, BLOCK_COOLDOWN_MS, veryNear, vib);
+    return;
+  }
+  if (center.length) return;
+
+  // 3) "सीधे जाओ" sirf tab jab scene model bhi "clear floor" bole
+  if (scene !== "clear") { clearCount = 0; return; }
+  clearCount++;
+  if (clearCount >= CLEAR_FRAMES_NEEDED) speak("सीधे जाओ", "Go straight", "straight", CLEAR_COOLDOWN_MS);
 }
 
-
-// ======================================
-// DRAW DETECTED OBJECTS
-// ======================================
-
-function drawObjects(predictions) {
-
-  ctx.clearRect(
-    0,
-    0,
-    canvas.width,
-    canvas.height
-  );
-
-  // Divide screen into three parts
-
+// ================= Draw =================
+function drawAndCollect(predictions) {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
   ctx.strokeStyle = "rgba(255,255,255,0.35)";
   ctx.lineWidth = 2;
-
   ctx.beginPath();
-
-  ctx.moveTo(canvas.width * 0.33, 0);
-  ctx.lineTo(canvas.width * 0.33, canvas.height);
-
-  ctx.moveTo(canvas.width * 0.66, 0);
-  ctx.lineTo(canvas.width * 0.66, canvas.height);
-
+  ctx.moveTo(canvas.width * 0.33, 0); ctx.lineTo(canvas.width * 0.33, canvas.height);
+  ctx.moveTo(canvas.width * 0.66, 0); ctx.lineTo(canvas.width * 0.66, canvas.height);
   ctx.stroke();
-
-  let accepted = 0;
-
-  for (const prediction of predictions) {
-
-    if (prediction.score < OBJECT_MIN_SCORE) {
-      continue;
-    }
-
-    accepted++;
-
-    const [x, y, w, h] = prediction.bbox;
-
-    const areaRatio =
-      getBoxAreaRatio(prediction.bbox);
-
-    const boxColor =
-      areaRatio >= LARGE_BOX_AREA
-        ? "#ff5b5b"
-        : "#00e68a";
-
-    const side =
-      getDirection(prediction.bbox);
-
-    const label =
-      `${prediction.class} (${Math.round(
-        prediction.score * 100
-      )}%) - ${side}`;
-
-    ctx.strokeStyle = boxColor;
-    ctx.lineWidth = 3;
-
-    ctx.strokeRect(x, y, w, h);
-
+  const objs = [];
+  for (const p of predictions) {
+    if (p.score < MIN_SCORE) continue;
+    const area = getArea(p.bbox);
+    const o = { class: p.class, area, dir: getDirection(p.bbox), dist: getDistance(area) };
+    objs.push(o);
+    const [x, y, w, h] = p.bbox;
+    const color = o.dist === "bahut paas" ? "#ff5b5b" : "#00e68a";
+    ctx.strokeStyle = color; ctx.lineWidth = 3; ctx.strokeRect(x, y, w, h);
+    const label = `${o.class} - ${o.dir}, ${o.dist}`;
     ctx.font = "16px Arial";
-
-    const labelWidth =
-      ctx.measureText(label).width;
-
-    const labelY = Math.max(0, y - 24);
-
-    ctx.fillStyle = boxColor;
-
-    ctx.fillRect(
-      x,
-      labelY,
-      labelWidth + 10,
-      24
-    );
-
-    ctx.fillStyle = "#111";
-
-    ctx.fillText(
-      label,
-      x + 5,
-      labelY + 17
-    );
-
+    const tw = ctx.measureText(label).width, ly = Math.max(0, y - 24);
+    ctx.fillStyle = color; ctx.fillRect(x, ly, tw + 10, 24);
+    ctx.fillStyle = "#111"; ctx.fillText(label, x + 5, ly + 17);
   }
-
-  return accepted;
-
+  return objs;
 }
 
-
-// ======================================
-// OBJECT VOICE ALERTS
-// ======================================
-
-function maybeAnnounceObject(predictions) {
-
-  const candidates = predictions
-
-    .filter(p =>
-      p.score >= OBJECT_MIN_SCORE
-    )
-
-    .map(p => ({
-
-      name: p.class,
-
-      score: p.score,
-
-      area: getBoxAreaRatio(p.bbox),
-
-      side: getDirection(p.bbox)
-
-    }))
-
-    .filter(o =>
-      o.area >= LARGE_BOX_AREA
-    )
-
-    .sort((a, b) =>
-      b.area - a.area
-    );
-
-
-  if (!candidates.length) {
-
-    lastObjectAlertKey = "";
-
-    return;
-
-  }
-
-
-  const item = candidates[0];
-
-  const key =
-    `${item.name}-${item.side}`;
-
-  const now = Date.now();
-
-
-  if (
-    key === lastObjectAlertKey &&
-    now - lastObjectAlertAt < OBJECT_ALERT_COOLDOWN
-  ) {
-
-    return;
-
-  }
-
-
-  lastObjectAlertKey = key;
-  lastObjectAlertAt = now;
-
-
-  const sideHi =
-    item.side === "left"
-      ? "बाईं तरफ"
-      : item.side === "right"
-      ? "दाईं तरफ"
-      : "सामने";
-
-
-  const sideEn =
-    item.side === "left"
-      ? "on the left"
-      : item.side === "right"
-      ? "on the right"
-      : "in the center";
-
-
-  speak(
-    `${item.name}, ${sideHi} दिखाई दे रहा है।`,
-    `${item.name} detected ${sideEn}.`
-  );
-
-}
-
-
-// ======================================
-// TEACHABLE MACHINE SCENE CLASSIFICATION
-// ======================================
-
-function sceneMessage(className) {
-
-  const key =
-    className.toLowerCase().trim();
-
-
-  if (key === "clear floor") {
-
-    return [
-
-      "फर्श जैसा दृश्य दिखाई दे रहा है। रास्ता सुरक्षित होने की पुष्टि नहीं है।",
-
-      "Floor-like scene detected. This does not confirm the path is safe."
-
-    ];
-
-  }
-
-
-  if (
-    key === "wall door" ||
-    key === "wall door close"
-  ) {
-
-    return [
-
-      "दीवार या दरवाजे जैसा दृश्य दिखाई दे रहा है।",
-
-      "Wall or door-like scene detected."
-
-    ];
-
-  }
-
-
-  if (key === "stairs up") {
-
-    return [
-
-      "सीढ़ियों जैसा दृश्य दिखाई दे रहा है। सावधानी रखें।",
-
-      "Stairs-like scene detected. Please use caution."
-
-    ];
-
-  }
-
-
-  return [
-
-    `${className} जैसा दृश्य दिखाई दे रहा है।`,
-
-    `${className} scene detected.`
-
-  ];
-
-}
-
-
-// ======================================
-// RUN TRAINED SCENE MODEL
-// ======================================
-
-async function detectScene() {
-
-  if (
-    !sceneModel ||
-    !running ||
-    video.readyState < 2
-  ) {
-
-    return;
-
-  }
-
-
-  const predictions =
-    await sceneModel.predict(video);
-
-
-  predictions.sort((a, b) =>
-    b.probability - a.probability
-  );
-
-
-  const best = predictions[0];
-
-
-  if (
-    !best ||
-    best.probability < SCENE_CONFIDENCE
-  ) {
-
-    statusEl.textContent =
-      "Scene unclear — keep testing safely";
-
-    return;
-
-  }
-
-
-  const now = Date.now();
-
-  const labelChanged =
-    best.className !== lastSceneLabel;
-
-  const intervalPassed =
-    now - lastSceneAt >= SCENE_INTERVAL_MS;
-
-
-  if (
-    labelChanged ||
-    (
-      intervalPassed &&
-      best.className === lastSceneLabel
-    )
-  ) {
-
-    lastSceneLabel = best.className;
-
-    lastSceneAt = now;
-
-    const message =
-      sceneMessage(best.className);
-
-
-    speak(
-      message[0],
-      message[1]
-    );
-
-
-    statusEl.textContent =
-      `Scene: ${best.className} (${
-        Math.round(best.probability * 100)
-      }%)`;
-
-  }
-
-}
-
-
-// ======================================
-// MAIN DETECTION LOOP
-// ======================================
-
+// ================= Main loop =================
 async function loop() {
-
   if (!running) return;
-
   try {
-
-    if (
-      video.readyState >= 2 &&
-      objectModel
-    ) {
-
-      const predictions =
-        await objectModel.detect(video);
-
-
-      const count =
-        drawObjects(predictions);
-
-
-      maybeAnnounceObject(predictions);
-
-
-      if (!lastSceneLabel) {
-
-        statusEl.textContent =
-          count
-            ? `${count} object(s) detected · checking scene...`
-            : "No confident objects detected · checking scene...";
-
-      }
-
+    loopCount++;
+    if (video.readyState >= 2) {
+      const predictions = await objectModel.detect(video);
+      if (sceneModel && loopCount % SCENE_EVERY_N_LOOPS === 0) scene = await classifyScene();
+      const objs = drawAndCollect(predictions);
+      statusEl.textContent = objs.length ? `${objs.length} cheez detect hui` : "Kuch detect nahi hua";
+      decide(objs);
     }
-
-
-    // Scene classification runs less frequently
-    // to reduce device load.
-
-    if (
-      running &&
-      sceneModel &&
-      Date.now() - lastSceneAt >= SCENE_INTERVAL_MS
-    ) {
-
-      await detectScene();
-
-    }
-
-  } catch (error) {
-
-    console.error(
-      "Detection loop error:",
-      error
-    );
-
-    statusEl.textContent =
-      "Detection issue: " + error.message;
-
+  } catch (e) {
+    console.error("Loop error:", e);
+    statusEl.textContent = "Detection issue: " + e.message;
   }
-
-
-  if (running) {
-
-    loopTimer = setTimeout(() => {
-
-      requestAnimationFrame(loop);
-
-    }, LOOP_DELAY_MS);
-
-  }
-
+  if (running) loopTimer = setTimeout(() => requestAnimationFrame(loop), LOOP_DELAY_MS);
 }
-
-
-// ======================================
-// STOP ASSIST
-// ======================================
 
 async function stopAssist() {
-
   running = false;
-
-  if (loopTimer) {
-
-    clearTimeout(loopTimer);
-
-    loopTimer = null;
-
-  }
-
-
-  if ("speechSynthesis" in window) {
-
-    speechSynthesis.cancel();
-
-  }
-
-
+  if (loopTimer) { clearTimeout(loopTimer); loopTimer = null; }
+  if ("speechSynthesis" in window) speechSynthesis.cancel();
   await releaseScreenLock();
-
   stopCamera();
-
-
-  ctx.clearRect(
-    0,
-    0,
-    canvas.width,
-    canvas.height
-  );
-
-
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
   btn.textContent = "Start";
-
   statusEl.textContent = "Stopped";
-
 }
 
-
-// ======================================
-// START BUTTON
-// ======================================
-
 btn.addEventListener("click", async () => {
-
-  if (running) {
-
-    await stopAssist();
-
-    return;
-
-  }
-
-
+  if (running) { await stopAssist(); return; }
   btn.disabled = true;
-
-  statusEl.textContent =
-    "Starting camera...";
-
   spokenEl.textContent = "";
-
-
   try {
-
-    // Unlock speech on user interaction
-
-    if ("speechSynthesis" in window) {
-
-      const unlock =
-        new SpeechSynthesisUtterance("");
-
-      speechSynthesis.speak(unlock);
-
-    }
-
-
-    // Start camera
-
+    if ("speechSynthesis" in window) speechSynthesis.speak(new SpeechSynthesisUtterance(""));
+    statusEl.textContent = "Camera chalu ho raha hai...";
     await startCamera();
-
     await keepScreenOn();
-
-
-    // Load COCO-SSD
-
     if (!objectModel) {
-
-      statusEl.textContent =
-        "Loading object detection model...";
-
-      objectModel =
-        await cocoSsd.load({
-
-          base: "lite_mobilenet_v2"
-
-        });
-
+      statusEl.textContent = "Object model load ho raha hai...";
+      objectModel = await cocoSsd.load({ base: "lite_mobilenet_v2" });
     }
-
-
-    // Load your trained Teachable Machine model
-
     if (!sceneModel) {
-
-      statusEl.textContent =
-        "Loading your trained scene model...";
-
-      sceneModel =
-        await tmImage.load(
-
-          SCENE_MODEL_URL + "model.json",
-
-          SCENE_MODEL_URL + "metadata.json"
-
-        );
-
+      statusEl.textContent = "Scene model load ho raha hai...";
+      try { await loadSceneModel(); }
+      catch (e) { console.error(e); sceneModel = null; statusEl.textContent = "Scene model load nahi hua. 'Seedhe jao' band rahega."; }
     }
-
-
-    // Start detection
-
     running = true;
-
-    lastSceneLabel = "";
-    lastSceneAt = 0;
-
-    lastObjectAlertAt = 0;
-    lastObjectAlertKey = "";
-
-
+    lastScene = null; sceneStreak = 0; scene = "unknown"; clearCount = 0; centerStreak = 0;
     btn.textContent = "Stop";
-
-    statusEl.textContent =
-      "Running · object + scene detection";
-
-
-    speak(
-      "ब्लाइंड असिस्ट शुरू हो गया है।",
-      "Blind Assist started."
-    );
-
-
+    if (sceneModel) statusEl.textContent = "Chal raha hai: object + scene" + (hindiVoice ? " (Hindi voice)" : " (English voice)");
+    speak("शुरू", "Started", "start", 0);
     loop();
-
-
-  } catch (error) {
-
-    console.error(error);
-
-    statusEl.textContent =
-      "Error: " + error.message;
-
+  } catch (e) {
+    console.error(e);
     await stopAssist();
-
-    statusEl.textContent =
-      "Could not start: " + error.message;
-
+    statusEl.textContent = "Could not start: " + e.message;
   } finally {
-
     btn.disabled = false;
-
   }
-
 });
-
-
-// ======================================
-// CLEANUP WHEN PAGE CLOSES
-// ======================================
 
 window.addEventListener("pagehide", () => {
-
   running = false;
-
-  if (cameraStream) {
-
-    cameraStream.getTracks().forEach(track =>
-      track.stop()
-    );
-
-  }
-
-  if ("speechSynthesis" in window) {
-
-    speechSynthesis.cancel();
-
-  }
-
+  if (cameraStream) cameraStream.getTracks().forEach(t => t.stop());
+  if ("speechSynthesis" in window) speechSynthesis.cancel();
 });
-
 </script>
-
 </body>
 </html>
