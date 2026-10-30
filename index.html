@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Blind Assist - Speech + Cooldown + Priority</title>
+<style>
+  body { margin: 0; background: #111; color: #eee; font-family: sans-serif; text-align: center; }
+  #wrap { position: relative; display: inline-block; margin-top: 10px; }
+  video, canvas { width: 640px; max-width: 100vw; height: auto; display: block; }
+  canvas { position: absolute; top: 0; left: 0; }
+  button { font-size: 24px; padding: 16px 40px; margin: 12px; border-radius: 12px; border: 0; background: #2e8b57; color: #fff; cursor: pointer; }
+  #status { font-size: 18px; margin: 8px; }
+  #spoken { font-size: 22px; margin: 8px; color: #ffd54a; min-height: 30px; }
+</style>
+</head>
+<body>
+  <div id="status">Start dabao</div>
+  <button id="btn">Start</button>
+  <div id="spoken"></div>
+  <div id="wrap">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="canvas"></canvas>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3"></script>
+  <script>
+    const video = document.getElementById("video");
+    const canvas = document.getElementById("canvas");
+    const ctx = canvas.getContext("2d");
+    const statusEl = document.getElementById("status");
+    const spokenEl = document.getElementById("spoken");
+    const btn = document.getElementById("btn");
+
+    let model = null;
+    let running = false;
+
+    // ---------- SETTINGS (yahin se tune karna) ----------
+    const MIN_SCORE = 0.6;        // isse kam confidence ignore
+    const COOLDOWN_MS = 4000;     // same baat dobara 4 sec baad hi
+    const LOOP_DELAY_MS = 300;    // ~3 FPS
+    const NEAR_AREA = 0.15;       // isse bada box = "thodi door" ya usse paas
+    const VERY_NEAR_AREA = 0.4;   // isse bada box = "bahut paas"
+
+    // ---------- Speech setup ----------
+    let hindiVoice = null;
+    function pickVoice() {
+      const voices = speechSynthesis.getVoices();
+      hindiVoice = voices.find(v => v.lang.toLowerCase().startsWith("hi")) || null;
+    }
+    pickVoice();
+    speechSynthesis.onvoiceschanged = pickVoice;
+
+    const lastSpoken = {};        // key -> time
+    function speak(text, key, urgent = false) {
+      const now = Date.now();
+      if (lastSpoken[key] && now - lastSpoken[key] < COOLDOWN_MS) return;
+      if (speechSynthesis.speaking) {
+        if (!urgent) return;      // normal baat: chal rahi baat ko mat kaato
+        speechSynthesis.cancel(); // danger: purani baat roko, naya bolo
+      }
+      lastSpoken[key] = now;
+      const u = new SpeechSynthesisUtterance(text);
+      if (hindiVoice) { u.voice = hindiVoice; u.lang = hindiVoice.lang; } else { u.lang = "en-IN"; }
+      u.rate = 1.05;
+      speechSynthesis.speak(u);
+      spokenEl.textContent = "🔊 " + text;
+      console.log("SPEAK:", text);
+    }
+
+    // ---------- Words (Hindi voice mile to Hindi, warna English) ----------
+    const NAMES_HI = {
+      person: "आदमी", chair: "कुर्सी", bottle: "बोतल", laptop: "लैपटॉप", "cell phone": "फोन",
+      bench: "बेंच", car: "गाड़ी", dog: "कुत्ता", couch: "सोफा", bed: "बिस्तर", tv: "टीवी",
+      cup: "कप", "dining table": "मेज़", backpack: "बैग", bicycle: "साइकिल", motorcycle: "बाइक"
+    };
+    const hi = () => !!hindiVoice;
+    const nameOf = c => (hi() && NAMES_HI[c]) ? NAMES_HI[c] : c;
+    const distWord = d => hi() ? (d === "bahut paas" ? "बहुत पास" : "थोड़ी दूर") : (d === "bahut paas" ? "very close" : "a bit far");
+    const sideWord = s => hi() ? (s === "left" ? "बाएं" : s === "right" ? "दाएं" : "सामने") : s;
+
+    function sayCenterBlocked(obj, freeSide) {
+      const n = nameOf(obj.class), d = distWord(obj.dist);
+      if (!freeSide) return hi() ? `रुको, सामने ${n} है ${d}, दोनों तरफ़ रास्ता बंद है` : `Stop. ${n} ahead, ${d}. Both sides blocked.`;
+      return hi() ? `सामने ${n} है, ${d}. ${sideWord(freeSide)} से जाओ` : `${n} ahead, ${d}. Go ${freeSide}.`;
+    }
+    function saySideWarning(obj) {
+      const n = nameOf(obj.class);
+      return hi() ? `${sideWord(obj.dir)} में ${n} बहुत पास है` : `${n} very close on the ${obj.dir}.`;
+    }
+
+    // ---------- Camera ----------
+    async function startCamera() {
+      const stream = await navigator.mediaDevices.getUserMedia({
+  video: { facingMode: { ideal: "environment" } }
+});
+      video.srcObject = stream;
+      await new Promise(r => (video.onloadedmetadata = r));
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+    }
+
+    // ---------- Direction + distance ----------
+    function getDirection(bbox) {
+      const [x, , w] = bbox;
+      const ratio = (x + w / 2) / video.videoWidth;
+      if (ratio < 0.33) return "left";
+      if (ratio > 0.66) return "right";
+      return "samne";
+    }
+    function getArea(bbox) {
+      return (bbox[2] * bbox[3]) / (video.videoWidth * video.videoHeight);
+    }
+    function getDistance(area) {
+      if (area > VERY_NEAR_AREA) return "bahut paas";
+      if (area > NEAR_AREA) return "thodi door";
+      return "door";
+    }
+
+    // ---------- Decision logic ----------
+    function decide(objs) {
+      // sirf paas wali cheezein matter karti hain
+      const near = objs.filter(o => o.dist !== "door");
+      const center = near.filter(o => o.dir === "samne").sort((a, b) => b.area - a.area);
+      const left = near.filter(o => o.dir === "left");
+      const right = near.filter(o => o.dir === "right");
+
+      if (center.length) {
+        const top = center[0];
+        const leftLoad = left.reduce((s, o) => s + o.area, 0);
+        const rightLoad = right.reduce((s, o) => s + o.area, 0);
+        let freeSide = null;
+        if (leftLoad === 0 && rightLoad === 0) freeSide = "right"; // dono khaali: default right
+        else if (leftLoad === 0) freeSide = "left";
+        else if (rightLoad === 0) freeSide = "right";
+        // dono side mein kuch hai to freeSide = null (ruko)
+        const text = sayCenterBlocked(top, freeSide);
+        const key = `C:${top.class}:${top.dist}:${freeSide}`;
+        speak(text, key, top.dist === "bahut paas");
+        return;
+      }
+
+      // center khaali hai, par side mein koi bahut paas hai
+      const sideClose = [...left, ...right].filter(o => o.dist === "bahut paas").sort((a, b) => b.area - a.area);
+      if (sideClose.length) {
+        const o = sideClose[0];
+        speak(saySideWarning(o), `S:${o.class}:${o.dir}`);
+      }
+    }
+
+    // ---------- Main loop ----------
+    async function loop() {
+      if (!running) return;
+
+      const predictions = await model.detect(video);
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      ctx.strokeStyle = "rgba(255,255,255,0.3)";
+      ctx.beginPath();
+      ctx.moveTo(canvas.width * 0.33, 0); ctx.lineTo(canvas.width * 0.33, canvas.height);
+      ctx.moveTo(canvas.width * 0.66, 0); ctx.lineTo(canvas.width * 0.66, canvas.height);
+      ctx.stroke();
+
+      const objs = [];
+      for (const p of predictions) {
+        if (p.score < MIN_SCORE) continue;
+        const area = getArea(p.bbox);
+        const o = { class: p.class, score: p.score, bbox: p.bbox, area, dir: getDirection(p.bbox), dist: getDistance(area) };
+        objs.push(o);
+
+        const [x, y, w, h] = p.bbox;
+        ctx.strokeStyle = o.dist === "bahut paas" ? "#ff4d4d" : "#00ff88";
+        ctx.lineWidth = 3;
+        ctx.strokeRect(x, y, w, h);
+        const label = `${o.class} ${Math.round(o.score * 100)}% - ${o.dir}, ${o.dist}`;
+        ctx.font = "16px sans-serif";
+        const tw = ctx.measureText(label).width;
+        ctx.fillStyle = ctx.strokeStyle;
+        ctx.fillRect(x, y - 22, tw + 10, 22);
+        ctx.fillStyle = "#000";
+        ctx.fillText(label, x + 5, y - 5);
+      }
+
+      statusEl.textContent = objs.length ? `${objs.length} cheez detect hui` : "Kuch detect nahi hua";
+      decide(objs);
+
+      setTimeout(() => requestAnimationFrame(loop), LOOP_DELAY_MS);
+    }
+
+    btn.onclick = async () => {
+      if (running) {
+        running = false;
+        speechSynthesis.cancel();
+        btn.textContent = "Start";
+        statusEl.textContent = "Ruka hua";
+        return;
+      }
+      try {
+        btn.disabled = true;
+        // user click par speech "unlock" karo (browser ki rule)
+        speechSynthesis.speak(new SpeechSynthesisUtterance(" "));
+        statusEl.textContent = "Camera chalu ho raha hai...";
+        await startCamera();
+        if (!model) {
+          statusEl.textContent = "Model load ho raha hai...";
+          model = await cocoSsd.load({ base: "lite_mobilenet_v2" });
+        }
+        running = true;
+        btn.textContent = "Stop";
+        statusEl.textContent = "Chal raha hai" + (hindiVoice ? " (Hindi voice)" : " (English voice)");
+        loop();
+      } catch (e) {
+        console.error(e);
+        statusEl.textContent = "Error: " + e.message;
+      } finally {
+        btn.disabled = false;
+      }
+    };
+  </script>
+</body>
+</html>
